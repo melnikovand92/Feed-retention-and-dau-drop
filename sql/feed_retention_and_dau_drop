@@ -1,0 +1,217 @@
+-- =========================================================
+-- Retention рекламных пользователей и анализ провала DAU
+-- ClickHouse SQL (schema: simulator_20251120)
+-- =========================================================
+
+
+---------------------------------------------------
+-- 1. DAU ленты по дням
+-- Dataset: feed_dau_daily
+---------------------------------------------------
+SELECT
+    toDate(time) AS date,
+    countDistinct(user_id) AS dau
+FROM simulator_20251120.feed_actions
+GROUP BY date
+ORDER BY date;
+
+
+---------------------------------------------------
+-- 2. DAU по источникам (ads / organic)
+-- Dataset: feed_dau_by_source_daily
+---------------------------------------------------
+SELECT
+    toDate(time) AS date,
+    source,
+    countDistinct(user_id) AS dau
+FROM simulator_20251120.feed_actions
+GROUP BY
+    date,
+    source
+ORDER BY
+    date,
+    source;
+
+
+---------------------------------------------------
+-- 3. Когортный retention по источникам (ads / organic)
+--    для когорт с 2025-11-01 по 2025-11-21
+-- Dataset: feed_cohort_retention_by_source_daily
+---------------------------------------------------
+WITH users_first AS (
+    -- первая дата в ленте и источник пользователя (берём только когорты 1–21 ноября)
+    SELECT
+        user_id,
+        min(toDate(time)) AS start_date,
+        any(source)       AS traffic_source
+    FROM simulator_20251120.feed_actions
+    GROUP BY user_id
+    HAVING
+        start_date BETWEEN toDate('2025-11-01') AND toDate('2025-11-21')
+),
+
+base AS (
+    -- активные пользователи по когорте/дате/источнику + день жизни когорты
+    SELECT
+        uf.traffic_source,
+        uf.start_date,
+        toDate(f.time) AS date,
+        dateDiff('day', uf.start_date, toDate(f.time)) AS day_number,
+        countDistinct(uf.user_id) AS active_users
+    FROM simulator_20251120.feed_actions f
+    JOIN users_first uf USING (user_id)
+    WHERE
+        toDate(f.time) BETWEEN toDate('2025-11-01') AND toDate('2025-11-21')
+    GROUP BY
+        uf.traffic_source,
+        uf.start_date,
+        date,
+        day_number
+),
+
+cohort_size AS (
+    -- размер когорты = активные в день регистрации (day_number = 0)
+    SELECT
+        traffic_source,
+        start_date,
+        maxIf(active_users, day_number = 0) AS cohort_users
+    FROM base
+    GROUP BY
+        traffic_source,
+        start_date
+)
+
+SELECT
+    traffic_source AS source,                  -- 'ads' / 'organic'
+    toString(date)       AS date,              -- календарная дата
+    toString(start_date) AS start_date,        -- дата когорты
+    day_number,                                -- день жизни когорты (0,1,2,...)
+    active_users,
+    cohort_users,
+    round(active_users * 100.0 / cohort_users, 1) AS retention_pct
+FROM base
+JOIN cohort_size USING (traffic_source, start_date)
+ORDER BY source, start_date, day_number;
+
+
+----------------------------------------------------------
+-- 4. Retention рекламной когорты 8 ноября (source = 'ads')
+-- Dataset: feed_ads_retention_cohort_2025_11_08
+----------------------------------------------------------
+WITH users_first AS (
+    -- первая дата в ленте и источник пользователя
+    -- оставляем только рекламную когорту со стартом 2025-11-08
+    SELECT
+        user_id,
+        min(toDate(time)) AS start_date,
+        any(source)       AS traffic_source
+    FROM simulator_20251120.feed_actions
+    WHERE source = 'ads'                              -- только реклама
+    GROUP BY user_id
+    HAVING start_date = toDate('2025-11-08')         -- фиксируем дату когорты
+),
+
+base AS (
+    -- активные пользователи по когорте/дате/источнику + день жизни когорты
+    SELECT
+        uf.traffic_source,
+        uf.start_date,
+        toDate(f.time) AS date,
+        dateDiff('day', uf.start_date, toDate(f.time)) AS day_number,
+        countDistinct(uf.user_id) AS active_users
+    FROM simulator_20251120.feed_actions f
+    JOIN users_first uf USING (user_id)
+    GROUP BY
+        uf.traffic_source,
+        uf.start_date,
+        date,
+        day_number
+),
+
+cohort_size AS (
+    -- размер когорты = активные в день регистрации (day_number = 0)
+    SELECT
+        traffic_source,
+        start_date,
+        maxIf(active_users, day_number = 0) AS cohort_users
+    FROM base
+    GROUP BY
+        traffic_source,
+        start_date
+)
+
+SELECT
+    traffic_source AS source,          -- 'ads' (по факту будет только реклама)
+    start_date,                        -- дата когорты (Date)
+    date,                              -- календарная дата (Date)
+    day_number,                        -- день жизни когорты (0,1,2,...)
+    active_users,
+    cohort_users,
+    round(active_users * 100.0 / cohort_users, 1) AS retention_pct
+FROM base
+JOIN cohort_size USING (traffic_source, start_date)
+WHERE traffic_source = 'ads'           -- дополнительная защита, что только ads
+ORDER BY day_number;
+
+
+----------------------------------------------------------
+-- 5. DAU по ОС и exp_group (для анализа тестовых групп)
+-- Dataset: feed_dau_by_os_exp_daily
+----------------------------------------------------------
+SELECT
+    toDate(time) AS date,     
+    os,
+    exp_group,
+    countDistinct(user_id) AS dau
+FROM simulator_20251120.feed_actions
+GROUP BY
+    date,
+    os,
+    exp_group
+ORDER BY
+    date,
+    os,
+    exp_group;
+
+
+----------------------------------------------------------
+-- 6. DAU по странам (топ-5) для анализа провала
+-- Dataset: feed_dau_by_country_daily_top5
+----------------------------------------------------------
+WITH top_countries AS (
+    -- Топ-5 стран по DAU в день до провала (2025-11-16)
+    SELECT
+        country
+    FROM (
+        SELECT
+            country,
+            countDistinct(user_id) AS dau
+        FROM simulator_20251120.feed_actions
+        WHERE toDate(time) = toDate('2025-11-16')
+        GROUP BY country
+        ORDER BY dau DESC
+        LIMIT 5
+    )
+),
+
+daily_dau AS (
+    -- Ежедневный DAU по этим странам
+    SELECT
+        toDate(time)           AS date,      -- нормальная Date
+        country,
+        countDistinct(user_id) AS dau
+    FROM simulator_20251120.feed_actions
+    WHERE country IN (SELECT country FROM top_countries)
+    GROUP BY
+        date,
+        country
+)
+
+SELECT
+    date,
+    country,
+    dau
+FROM daily_dau
+ORDER BY
+    date,
+    country;
